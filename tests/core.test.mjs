@@ -1,0 +1,43 @@
+import test from 'node:test';import assert from 'node:assert/strict';
+import {PLANS,canConsume,mediaExpires,mediaUsableAt,canUseProvider,quotaFor,MAX_MEDIA_BYTES} from '../packages/core/src/domain.ts';
+import {preflight,isBlocked} from '../packages/core/src/guardrails.ts';
+import {reserve,settleReserved,release,available,mayReserve} from '../packages/core/src/credits.ts';
+import {nextSlots,idempotencyKey} from '../packages/core/src/scheduling.ts';
+import {requireEncryptionKey,encryptToken,decryptToken,signedState,verifyState} from '../packages/core/src/security.ts';
+import {pkcePair,nonce,buildAuthorizationUrl} from '../packages/core/src/oauth.ts';
+import {normalizeKenyanPhone} from '../packages/core/src/money.ts';
+import {canActuallyPublish} from '../packages/core/src/domain.ts';
+
+test('free plan permits limited premium functionality',()=>{assert.equal(PLANS.free.oldVideos,20);assert.equal(PLANS.free.imageCredits,2);assert.equal(quotaFor('creator','publishing'),300)});
+test('validate credit quantities',()=>{assert.equal(canConsume(20,19,1),true);assert.equal(canConsume(20,20,1),false);assert.equal(canConsume(20,-1,1),false);assert.equal(canConsume(20,1,-2),false)});
+test('seven-day media retention',()=>{assert.equal(mediaExpires('2026-11-01T00:00:00Z'),'2026-11-08T00:00:00.000Z');assert.equal(mediaUsableAt('2026-11-08T00:00:00Z','2026-11-07T00:00:00Z'),true);assert.equal(mediaUsableAt('2026-11-08T00:00:00Z','2026-11-08T00:00:00Z'),false)});
+test('media limit is 100 MiB',()=>assert.equal(MAX_MEDIA_BYTES,104857600));
+test('destination capabilities do not claim YouTube text posting',()=>{assert.equal(canUseProvider('youtube','text'),false);assert.equal(canUseProvider('youtube','video'),true);assert.equal(canUseProvider('fake','video'),false)});
+test('active publishing adapters more restrictive than advertised capabilities',()=>{assert.equal(canActuallyPublish('facebook','text'),true);assert.equal(canActuallyPublish('facebook','image'),false);assert.equal(canActuallyPublish('youtube','video'),true);assert.equal(canActuallyPublish('tiktok','video'),false)});
+test('preflight blocks unknown and unauthorized providers',()=>{const x=preflight({provider:'youtube',kind:'text',permissionGranted:false,accountConnected:false,scheduledAt:new Date(Date.now()+3600000).toISOString(),publishingEnabled:true});assert.equal(isBlocked(x),true);assert.ok(x.find(y=>y.code==='UNSUPPORTED_FORMAT'));assert.ok(x.find(y=>y.code==='MISSING_PERMISSION'))});
+test('preflight blocks expiry and file >100 MiB',()=>{const x=preflight({provider:'youtube',kind:'video',permissionGranted:true,accountConnected:true,scheduledAt:'2026-12-01T12:00:00Z',publishingEnabled:true,media:{available:true,byteSize:104857601,expiresAt:'2026-11-30T12:00:00Z'}});assert.ok(x.some(y=>y.code==='MEDIA_EXPIRED'));assert.ok(x.some(y=>y.code==='MEDIA_TOO_LARGE'))});
+test('preflight blocks duplicate publication',()=>{const x=preflight({provider:'facebook',kind:'text',permissionGranted:true,accountConnected:true,scheduledAt:'2026-11-22T12:00:00Z',alreadyPublished:true,publishingEnabled:true});assert.equal(isBlocked(x),true)});
+test('wallet reservation and settlement consume monthly first',()=>{const start={monthly:3,topup:5,reserved:0};const booked=reserve(start,6);assert.deepEqual(booked,{monthly:3,topup:5,reserved:6});const settled=settleReserved(booked,6);assert.equal(settled.monthlySpent,3);assert.equal(settled.topupSpent,3);assert.deepEqual(settled.remaining,{monthly:0,topup:2,reserved:0})});
+test('wallet releases failed AI job reservation',()=>{const w=reserve({monthly:2,topup:0,reserved:0},1);assert.deepEqual(release(w,1),{monthly:2,topup:0,reserved:0})});
+test('wallet refuses negative or excess charges',()=>{assert.equal(mayReserve({monthly:1,topup:0,reserved:1},1),false);assert.throws(()=>reserve({monthly:1,topup:0,reserved:0},2));assert.throws(()=>release({monthly:1,topup:0,reserved:0},1));assert.equal(available({monthly:0,topup:0,reserved:4}),0)});
+test('slot scheduler respects weekday and IANA time zone',()=>{const from=new Date('2026-11-16T05:59:00Z');const slot={hour:9,minute:0,weekdays:[1,2,3,4,5]};const result=nextSlots(from,2,slot,'Africa/Nairobi');assert.equal(result.length,2);assert.equal(result[0].toISOString(),'2026-11-16T06:00:00.000Z');assert.equal(result[1].toISOString(),'2026-11-17T06:00:00.000Z')});
+test('publishing keys unique by content, destination and time',()=>{assert.notEqual(idempotencyKey('c','a','2026-11-16T10:00:00Z'),idempotencyKey('c','b','2026-11-16T10:00:00Z'))});
+test('AES-GCM token encryption roundtrip and tamper rejection',()=>{const key=requireEncryptionKey('ab'.repeat(32));const encrypted=encryptToken('private access token',key);assert.equal(decryptToken(encrypted,key),'private access token');const raw=Buffer.from(encrypted,'base64url');raw[raw.length-1]^=1;assert.throws(()=>decryptToken(raw.toString('base64url'),key))});
+test('signed OAuth state requires HMAC integrity',()=>{const k=requireEncryptionKey('cd'.repeat(32));const s=signedState('id',nonce(),k);assert.equal(verifyState(s,k),true);assert.equal(verifyState(s+'x',k),false)});
+test('PKCE S256 challenge has valid shape',()=>{const p=pkcePair();assert.ok(p.verifier.length>=43);assert.match(p.challenge,/^[A-Za-z0-9_-]{43}$/);assert.ok(buildAuthorizationUrl('https://example.com/auth',{state:'abc'}).includes('state=abc'))});
+test('Kenyan phone normalization',()=>{assert.equal(normalizeKenyanPhone('0712 345 678'),'254712345678');assert.equal(normalizeKenyanPhone('+254 712 345 678'),'254712345678');assert.equal(normalizeKenyanPhone('invalid'),null)});
+import {validateClip,buildClipArgs} from '../packages/core/src/video.ts';
+test('video repurposing accepts only positive clips of at most 60 seconds',()=>{
+ assert.deepEqual(validateClip(10,50),{start:10,end:50,duration:40});
+ for(const pair of [[-1,4],[2,2],[9,1],[1,70],[Number.NaN,5]])assert.throws(()=>validateClip(pair[0],pair[1]));
+});
+test('video clip conversion pads rather than silently crops',()=>{
+ const args=buildClipArgs('/tmp/source.mp4','/tmp/clip.mp4',5,20,'vertical');
+ assert.ok(args.includes('-vf'));assert.ok(args.join(' ').includes('pad=720:1280'));assert.ok(!args.join(' ').includes('crop='));
+ assert.ok(args.includes('15'));
+});
+test('video clip processing never uses a shell script as a media input',()=>{
+ const args=buildClipArgs('video;touch /tmp/pwned','target.mp4',0,1,'square');
+ assert.equal(args[args.indexOf('-i')+1],'video;touch /tmp/pwned');
+ assert.equal(args.at(-1),'target.mp4');
+});
